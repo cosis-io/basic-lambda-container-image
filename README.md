@@ -1,0 +1,1 @@
+# basic-lambda-container-image
