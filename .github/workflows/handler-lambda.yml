@@ -1,0 +1,118 @@
+name: lambda-handler
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - './**'
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: lambda-handler
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'alpha' && 'dev' || 'prod'}}
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_GH_ACTION_ROLE: ${{ secrets.AWS_GH_ACTION_ROLE }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      ENVIRONMENT: ${{ github.ref_name == 'alpha' && 'dev' || 'prod'}}
+      GH_ACTOR: ${{ github.actor }}
+      GH_REPOSITORY: 'codeclout/accounted'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      -
+        name: checkout
+        uses: actions/checkout@v4
+      -
+        name: setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: './handler-lambda-purpose/go.mod'
+          cache-dependency-path: './handler-lambda-purpose/go.sum'
+      -
+        name: golangci-lint
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: 'latest'
+          working-directory: './handler-lambda-purpose'
+
+          args: --timeout=3m --issues-exit-code=1
+          install-mode: "goinstall"
+      -
+        working-directory: './handler-lambda-purpose'
+        name: vulnerabilities check
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      -
+        name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-flags: --debug
+          version: v0.11.2
+      -
+        name: Get current time in milliseconds
+        id: role-session-marker
+        run: echo "::set-output name=session::gh-oidc-$(date +%s%N)"
+      -
+        name: configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_GH_ACTION_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ steps.role-session-marker.outputs.session }}
+      -
+        name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      -
+        working-directory: './handler-lambda-purpose'
+        name: set configuration
+        run: |
+          sed -i "s/%%env%%/$ENVIRONMENT/g" config.hcl
+          sed -i "s/%%version%%/IMAGE_TAG/g" config.hcl
+      -
+        working-directory: './handler-lambda-purpose'
+        name: build-image
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        run: |
+          make build-image
+      -
+        name: scan-image
+        uses: aquasecurity/trivy-action@master
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ vars.ENVIRONMENT }}-workflow-step-session-${{ env.IMAGE_TAG }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      -
+        working-directory: './handler-lambda-purpose'
+        name: push-image
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        run: |
+          make push-image

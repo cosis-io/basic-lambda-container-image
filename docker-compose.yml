@@ -1,0 +1,8 @@
+version: "3.8"
+
+services:
+  handler:
+    image: sch00l.io/${ENVIRONMENT}-<lambda-handler>:latest
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - ENVIRONMENT=${ENVIRONMENT}

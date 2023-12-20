@@ -1,0 +1,81 @@
+image: docker:24.0.7
+
+stages:
+  - aws
+  - lint
+  - vulnerability-check
+  - build
+#  - test
+#  - deploy
+
+.aws-oidc-prep: &aws-oidc-prep
+  - |
+    mkdir -p .aws
+    echo "${GITLAB_OIDC_TOKEN}" > .aws/web_identity_token
+    echo -e "[profile oidc]\nrole_arn=${AWS_ROLE_TO_ASSUME}\nweb_identity_token_file=.aws/web_identity_token" >> .aws/config
+
+assume role:
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [ "" ]
+  stage: aws
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - >
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+      $(aws sts assume-role-with-web-identity
+      --role-arn ${AWS_ROLE_TO_ASSUME}
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token ${GITLAB_OIDC_TOKEN}
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text))
+    - aws sts get-caller-identity
+    - *aws-oidc-prep
+  artifacts:
+    paths:
+      - .aws
+
+linter:
+  image: golang:1.21.5-alpine3.18
+  stage: lint
+  before_script:
+    - wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v1.55.2
+  script:
+    - cd ./handler-noreply-email
+    - ../bin/golangci-lint run --timeout=3m --issues-exit-code=1
+
+vulnerability check:
+  image: golang:1.21.5-alpine3.18
+  stage: vulnerability-check
+  script:
+    - |
+      apk update && apk upgrade
+      cd ./handler-noreply-email
+      go install golang.org/x/vuln/cmd/govulncheck@latest
+      govulncheck ./...
+
+build-and-push-image:
+  image: docker:latest
+  stage: build
+  services:
+    - docker:dind
+  before_script:
+    - apk update && apk upgrade
+    - apk add --no-cache aws-cli make bash git
+    - |
+      mkdir ~/.aws
+      cp .aws/config ~/.aws
+  script:
+    - >
+      aws ecr get-login-password 
+      --profile "oidc" 
+      --region $AWS_REGION 
+      | docker login --username AWS --password-stdin $DEV_ECR_REGISTRY_URL
+    - >
+      REGISTRY=$DEV_ECR_REGISTRY
+      REPOSITORY="${ENVIRONMENT}-notifications"
+      HANDLER_NO_REPLY_EMAIL_ROLE=$NO_REPLY_EMAIL_LAMBDA_EXECUTION_ROLE
+      make -C ./handler-noreply-email push-image
