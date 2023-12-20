@@ -39,6 +39,6 @@ func (a *Adapter) Handler(ctx context.Context, in *t.HandlerRequest, ch chan *t.
     return
   }
 
-  ch <- &core
+  ch <- core
   return
 }
